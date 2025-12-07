@@ -1,4 +1,5 @@
 from cellmap_segmentation_challenge.utils import load_safe_config
+import torch
 
 # Load the configuration file
 config_path = __file__.replace("process", "train")
@@ -15,8 +16,18 @@ classes = config.classes
 
 # Define the process function, which takes a numpy array as input and returns a numpy array as output
 def process_func(x):
-    # Simple thresholding function
-    return x > 0.5
+    """
+    Convert model logits to binary masks.
+    
+    x: numpy array of raw model outputs (logits)
+    Returns: binary numpy array (0 or 1)
+    """
+    # Apply sigmoid to convert logits to probabilities
+    import numpy as np
+    probs = 1 / (1 + np.exp(-x))  # sigmoid
+    
+    # Threshold at 0.5 to get binary masks
+    return (probs > 0.5).astype(np.uint8)
 
 
 if __name__ == "__main__":

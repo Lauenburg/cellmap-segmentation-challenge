@@ -26,34 +26,23 @@ def predict_orthoplanes(
     model: torch.nn.Module, dataset_writer_kwargs: dict[str, Any], batch_size: int
 ):
     print("Predicting orthogonal planes.")
-
-    # Make a temporary prediction for each axis
     tmp_dir = tempfile.TemporaryDirectory()
     print(f"Temporary directory for predictions: {tmp_dir.name}")
+    
     for axis in range(3):
-        # Actually slice per axis by permuting singleton dimension
         temp_kwargs = dataset_writer_kwargs.copy()
         temp_kwargs["target_path"] = os.path.join(
             tmp_dir.name, "output.zarr", str(axis)
         )
-        # Permute input_arrays and target_arrays so singleton is at the current axis
         input_arrays = {k: v.copy() for k, v in temp_kwargs["input_arrays"].items()}
         target_arrays = {k: v.copy() for k, v in temp_kwargs["target_arrays"].items()}
         permute_singleton_dimension(input_arrays, axis)
         permute_singleton_dimension(target_arrays, axis)
         temp_kwargs["input_arrays"] = input_arrays
         temp_kwargs["target_arrays"] = target_arrays
-        _predict(
-            model,
-            temp_kwargs,
-            batch_size=batch_size,
-        )
+        _predict(model, temp_kwargs, batch_size=batch_size)
 
-    # Get dataset writer for the average of predictions from x, y, and z orthogonal planes
-    # TODO: Skip loading raw data
     dataset_writer = CellMapDatasetWriter(**dataset_writer_kwargs)
-
-    # Load the images for the individual predictions
     single_axis_images = {
         array_name: {
             label: [
@@ -72,25 +61,20 @@ def predict_orthoplanes(
         for array_name, array_info in dataset_writer_kwargs["target_arrays"].items()
     }
 
-    # Combine the predictions from the x, y, and z orthogonal planes
     print("Combining predictions.")
     for batch in tqdm(dataset_writer.loader(batch_size=batch_size), dynamic_ncols=True):
-        # For each class, get the predictions from the x, y, and z orthogonal planes
-        outputs = {}
-        for array_name, images in single_axis_images.items():
-            outputs[array_name] = {}
-            for label in dataset_writer_kwargs["classes"]:
-                outputs[array_name][label] = []
-                for idx in batch["idx"]:
+        for idx in batch["idx"]:
+            idx_val = int(idx) if hasattr(idx, "item") else int(idx)
+            sample_out = {}
+            for array_name, images in single_axis_images.items():
+                sample_out[array_name] = {}
+                for label in dataset_writer_kwargs["classes"]:
                     average_prediction = []
                     for image in images[label]:
                         average_prediction.append(image[dataset_writer.get_center(idx)])
                     average_prediction = torch.stack(average_prediction).mean(dim=0)
-                    outputs[array_name][label].append(average_prediction)
-                outputs[array_name][label] = torch.stack(outputs[array_name][label])
-
-        # Save the outputs
-        dataset_writer[batch["idx"]] = outputs
+                    sample_out[array_name][label] = average_prediction
+            dataset_writer[idx_val] = sample_out
 
     tmp_dir.cleanup()
 
@@ -98,19 +82,6 @@ def predict_orthoplanes(
 def _predict(
     model: torch.nn.Module, dataset_writer_kwargs: dict[str, Any], batch_size: int
 ):
-    """
-    Predicts the output of a model on a large dataset by splitting it into blocks and predicting each block separately.
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        The model to use for prediction.
-    dataset_writer_kwargs : dict[str, Any]
-        A dictionary containing the arguments for the dataset writer.
-    batch_size : int
-        The batch size to use for prediction
-    """
-
     value_transforms = T.Compose(
         [
             Normalize(),
@@ -124,27 +95,47 @@ def _predict(
     )
     dataloader = dataset_writer.loader(batch_size=batch_size)
     model.eval()
-    # Find singleton dimension if there is one
-    # Only the first singleton dimension will be used for squeezing/unsqueezing.
-    # If there are multiple singleton dimensions, only the first is handled.
+    
     singleton_dim = np.where(
         [s == 1 for s in dataset_writer_kwargs["input_arrays"]["input"]["shape"]]
     )[0]
     singleton_dim = singleton_dim[0] if singleton_dim.size > 0 else None
+    classes = dataset_writer_kwargs["classes"]
+    
+    max_indices = int(os.getenv("CSC_PRED_MAX_INDICES", "0"))
+    processed = 0
+    
+    device = dataset_writer_kwargs.get("device", "cpu")
+    
     with torch.no_grad():
         for batch in tqdm(dataloader, dynamic_ncols=True):
-            # Get the inputs and outputs
-            inputs = batch["input"]
+            if max_indices > 0 and processed >= max_indices:
+                break
+                
+            inputs = batch["input"].to(device)
             if singleton_dim is not None:
-                # Remove singleton dimension
                 inputs = inputs.squeeze(dim=singleton_dim + 2)
+            
             outputs = model(inputs)
+            
             if singleton_dim is not None:
                 outputs = outputs.unsqueeze(dim=singleton_dim + 2)
-            outputs = {"output": outputs}
-
-            # Save the outputs
-            dataset_writer[batch["idx"]] = outputs
+            
+            for b, idx in enumerate(batch["idx"]):
+                if max_indices > 0 and processed >= max_indices:
+                    break
+                    
+                idx_val = int(idx) if hasattr(idx, "item") else int(idx)
+                sample_out = {"output": {}}
+                
+                for c, label in enumerate(classes):
+                    pred = outputs[b, c, ...]
+                    if pred.dim() == 2:
+                        pred = pred.unsqueeze(0)
+                    sample_out["output"][label] = pred
+                
+                dataset_writer[idx_val] = sample_out
+                processed += 1
 
 
 def predict(
@@ -188,7 +179,6 @@ def predict(
     target_array_info = getattr(config, "target_array_info", input_array_info)
     model = config.model
 
-    # %% Check that the GPU is available
     if getattr(config, "device", None) is not None:
         device = config.device
     elif torch.cuda.is_available():
@@ -199,38 +189,32 @@ def predict(
         device = "cpu"
     print(f"Prediction device: {device}")
 
-    # %% Move model to device
     model = model.to(device)
-
-    # Optionally, load a pre-trained model
     checkpoint_epoch = get_model(config)
     if checkpoint_epoch is not None:
         print(f"Loaded model checkpoint from epoch: {checkpoint_epoch}")
 
-    if do_orthoplanes and (
-        array_has_singleton_dim(input_array_info)
-        or is_array_2D(input_array_info, summary=any)
+    disable_orthoplanes = os.getenv("CSC_PRED_DISABLE_ORTHO", "").lower() in ("1", "true", "yes")
+
+    if (
+        not disable_orthoplanes
+        and do_orthoplanes
+        and (array_has_singleton_dim(input_array_info) or is_array_2D(input_array_info, summary=any))
     ):
-        # If the model is a 2D model, compute the average of predictions from x, y, and z orthogonal planes
+        print("Using 2.5D orthoplanes inference")
         predict_func = predict_orthoplanes
     else:
+        print("Using direct 2D slice-wise inference")
         predict_func = _predict
 
     input_arrays = {"input": input_array_info}
     target_arrays = {"output": target_array_info}
-    assert (
-        input_arrays is not None and target_arrays is not None
-    ), "No array info provided"
 
-    # Get the crops to predict on
     if crops == "test":
         test_crops = get_test_crops()
         dataset_writers = []
         for crop in test_crops:
-            # Get path to raw dataset
             raw_path = search_path.format(dataset=crop.dataset, name=raw_name)
-
-            # Get the boundaries of the crop
             target_bounds = {
                 "output": {
                     axis: [
@@ -241,8 +225,6 @@ def predict(
                     for i, axis in enumerate("zyx")
                 },
             }
-
-            # Create the writer
             dataset_writers.append(
                 {
                     "raw_path": raw_path,
@@ -264,8 +246,7 @@ def predict(
         for i, crop in enumerate(crop_list):
             if (isinstance(crop, str) and crop.isnumeric()) or isinstance(crop, int):
                 crop = f"crop{crop}"
-                crop_list[i] = crop  # type: ignore
-
+                crop_list[i] = crop
             crop_paths.extend(
                 glob(
                     search_path.format(
@@ -275,11 +256,8 @@ def predict(
             )
 
         dataset_writers = []
-        for crop, crop_path in zip(crop_list, crop_paths):  # type: ignore
-            # Get path to raw dataset
+        for crop, crop_path in zip(crop_list, crop_paths):
             raw_path = get_raw_path(crop_path, label="")
-
-            # Get the boundaries of the crop
             gt_images = {
                 array_name: CellMapImage(
                     str(UPath(crop_path) / classes[0]),
@@ -291,17 +269,11 @@ def predict(
                 )
                 for array_name, array_info in target_arrays.items()
             }
-
             target_bounds = {
                 array_name: image.bounding_box
                 for array_name, image in gt_images.items()
             }
-
-            dataset = get_formatted_fields(raw_path, search_path, ["{dataset}"])[
-                "dataset"
-            ]
-
-            # Create the writer
+            dataset = get_formatted_fields(raw_path, search_path, ["{dataset}"])["dataset"]
             dataset_writers.append(
                 {
                     "raw_path": raw_path,
@@ -315,5 +287,14 @@ def predict(
                 }
             )
 
-    for dataset_writer in dataset_writers:
-        predict_func(model, dataset_writer, batch_size)
+    print(f"Processing {len(dataset_writers)} crops")
+    for i, dataset_writer in enumerate(dataset_writers, 1):
+        target = dataset_writer["target_path"]
+        print(f"\n[{i}/{len(dataset_writers)}] Processing: {target}")
+        try:
+            predict_func(model, dataset_writer, batch_size)
+            print(f"✓ Completed: {target}")
+        except Exception as e:
+            print(f"✗ Failed: {target}")
+            print(f"  Error: {e}")
+            continue

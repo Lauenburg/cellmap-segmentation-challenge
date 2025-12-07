@@ -81,7 +81,8 @@ def train(config_path: str):
 
     # %% Load the configuration file
     config = load_safe_config(config_path)
-    # %% Set hyperparameters and other configurations from the config file
+
+    # %% Basic config
     base_experiment_path = getattr(
         config, "base_experiment_path", UPath(config_path).parent
     )
@@ -130,6 +131,7 @@ def train(config_path: str):
     use_s3 = getattr(config, "use_s3", False)
     use_mutual_exclusion = getattr(config, "use_mutual_exclusion", False)
     weighted_sampler = getattr(config, "weighted_sampler", True)
+    skip_all_zero_targets = getattr(config, "skip_all_zero_targets", False)
     train_raw_value_transforms = getattr(
         config,
         "train_raw_value_transforms",
@@ -159,8 +161,18 @@ def train(config_path: str):
     )
     max_grad_norm = getattr(config, "max_grad_norm", None)
     force_all_classes = getattr(config, "force_all_classes", "validate")
+    debug_overfit_single_batch = getattr(config, "debug_overfit_single_batch", False)
 
-    # %% Define the optimizer, from the config file or default to RAdam
+    # Loss, optimizer, scheduler, accumulation
+    criterion = getattr(config, "criterion", torch.nn.BCEWithLogitsLoss)
+    criterion_kwargs = getattr(config, "criterion_kwargs", {})
+    weight_loss = getattr(config, "weight_loss", True)
+    gradient_accumulation_steps = getattr(config, "gradient_accumulation_steps", 1)
+    if gradient_accumulation_steps < 1:
+        raise ValueError(
+            f"gradient_accumulation_steps must be >= 1, but got {gradient_accumulation_steps}"
+        )
+
     optimizer = getattr(
         config,
         "optimizer",
@@ -169,39 +181,30 @@ def train(config_path: str):
         ),
     )
 
-    # %% Define the scheduler, from the config file or default to None
     scheduler = getattr(config, "scheduler", None)
     if isinstance(scheduler, type):
         scheduler_kwargs = getattr(config, "scheduler_kwargs", {})
         scheduler = scheduler(optimizer, **scheduler_kwargs)
+    elif callable(scheduler) and not isinstance(scheduler, type):
+        scheduler_kwargs = getattr(config, "scheduler_kwargs", {})
+        scheduler = scheduler(optimizer, **scheduler_kwargs)
 
-    # %% Define the loss function, from the config file or default to BCEWithLogitsLoss
-    criterion = getattr(config, "criterion", torch.nn.BCEWithLogitsLoss)
-    criterion_kwargs = getattr(config, "criterion_kwargs", {})
-    weight_loss = getattr(config, "weight_loss", True)
+    dataloader_kwargs = getattr(config, "dataloader_kwargs", {})
 
-    gradient_accumulation_steps = getattr(
-        config, "gradient_accumulation_steps", 1
-    )  # default to 1 for no accumulation
-    if gradient_accumulation_steps < 1:
-        raise ValueError(
-            f"gradient_accumulation_steps must be >= 1, but got {gradient_accumulation_steps}"
-        )
-
-    # %% Make sure the save path exists
+    # Make dirs
     for path in [model_save_path, logs_save_path, datasplit_path]:
         dirpath = os.path.dirname(path)
         if len(dirpath) > 0:
             os.makedirs(dirpath, exist_ok=True)
 
-    # %% Set the random seed
+    # Seeds
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(random_seed)
     torch.manual_seed(random_seed)
     np.random.seed(random_seed)
     random.seed(random_seed)
 
-    # %% Check that the GPU is available
+    # Device
     if device is None:
         if torch.cuda.is_available():
             device = "cuda"
@@ -211,10 +214,9 @@ def train(config_path: str):
             device = "cpu"
     print(f"Training device: {device}")
 
-    # %% Make the datasplit file if it doesn't exist
+    # Datasplit
     if not os.path.exists(datasplit_path):
         if filter_by_scale is not False:
-            # Find highest resolution scale
             if filter_by_scale is not True:
                 scale = filter_by_scale
                 if isinstance(scale, (int, float)):
@@ -231,7 +233,6 @@ def train(config_path: str):
                 scale = highest_res
         else:
             scale = None
-        # Make the datasplit CSV
         if use_s3:
             make_s3_datasplit_csv(
                 classes=classes,
@@ -249,7 +250,7 @@ def train(config_path: str):
                 force_all_classes=force_all_classes,
             )
 
-    # %% Download the data and make the dataloader
+    # Dataloaders (no skip_all_zero_targets here)
     train_loader, val_loader = get_dataloader(
         datasplit_path=datasplit_path,
         classes=classes,
@@ -265,10 +266,10 @@ def train(config_path: str):
         train_raw_value_transforms=train_raw_value_transforms,
         val_raw_value_transforms=val_raw_value_transforms,
         target_value_transforms=target_value_transforms,
-        **config.get("dataloader_kwargs", {}),
+        **dataloader_kwargs,
     )
 
-    # %% If no model is provided, create a new model
+    # Model
     if model is None:
         if "2d" in model_name.lower():
             if "unet" in model_name.lower():
@@ -295,23 +296,21 @@ def train(config_path: str):
                 f"Unknown model name: {model_name}. Preconfigured models are '2d_unet', '2d_resnet', '3d_unet', '3d_resnet', and 'vitnet'. Otherwise provide a custom model as a torch.nn.Module."
             )
 
-    # Optionally, load a pre-trained model
     checkpoint_epoch = get_model(config)
 
-    # Create a variables for tracking iterations and offseting already completed epochs, if applicable
-    epochs = np.arange(epochs) + 1
+    epochs_arr = np.arange(epochs) + 1
     if model_to_load == model_name:
-        # Calculate the number of iterations to skip
-        # NOTE: This assumes that the number of iterations per epoch is consistent
         n_iter = checkpoint_epoch * iterations_per_epoch
-        epochs += checkpoint_epoch
+        epochs_arr += checkpoint_epoch
     else:
         n_iter = 0
 
-    # %% Move model to device
     model = model.to(device)
+    if next(model.parameters()).device != torch.device(device):
+        model = model.to(device)
+        print(f"Warning: Model was not on {device}, moved it explicitly.")
 
-    # Deduce number of spatial dimensions
+    # Spatial dims
     if "shape" in target_array_info:
         spatial_dims = sum([s > 1 for s in target_array_info["shape"]])
     else:
@@ -319,113 +318,124 @@ def train(config_path: str):
             [s > 1 for s in list(target_array_info.values())[0]["shape"]]
         )
 
-    # Use custom loss function wrapper that handles NaN values in the target. This works with any PyTorch loss function
+    # Loss wrapper + pos_weight
     if weight_loss:
         pos_weight = list(train_loader.dataset.class_weights.values())
         pos_weight = torch.tensor(pos_weight, dtype=torch.float32).to(device).flatten()
-
-        # Adjust weight for data dimensions
-        pos_weight = pos_weight[:, None, None]
-        if spatial_dims == 3:
-            pos_weight = pos_weight[..., None]
+        if spatial_dims == 2:
+            pos_weight = pos_weight.view(-1, 1, 1)
+        elif spatial_dims == 3:
+            pos_weight = pos_weight.view(-1, 1, 1, 1)
         criterion_kwargs["pos_weight"] = pos_weight
+
     criterion = CellMapLossWrapper(criterion, **criterion_kwargs)
 
     input_keys = list(train_loader.dataset.input_arrays.keys())
     target_keys = list(train_loader.dataset.target_arrays.keys())
 
-    # %% Train the model
     post_fix_dict = {}
-
-    # Define a summarywriter
     writer = SummaryWriter(format_string(logs_save_path, {"model_name": model_name}))
 
-    # Training outer loop, across epochs
+    debug_batch = None
+    if debug_overfit_single_batch:
+        debug_batch = next(iter(train_loader.loader))
+        print("Debug overfit mode enabled: training on a single fixed batch.")
+
     print(
-        f"Training {model_name} for {len(epochs)} epochs, starting at epoch {epochs[0]}, iteration {n_iter}..."
+        f"Training {model_name} for {len(epochs_arr)} epochs, starting at epoch {epochs_arr[0]}, iteration {n_iter}..."
     )
-    for epoch in epochs:
-
-        # Set the model to training mode to enable backpropagation
+    for epoch in epochs_arr:
         model.train()
-
-        # Training loop for the epoch
         post_fix_dict["Epoch"] = epoch
 
-        # Refresh the train loader to shuffle the data yielded by the dataloader
-        train_loader.refresh()
+        if not debug_overfit_single_batch:
+            train_loader.refresh()
 
-        # epoch_bar = tqdm(train_loader.loader, desc="Training", dynamic_ncols=True)
-        # for batch in epoch_bar:
         loader = iter(train_loader.loader)
         epoch_bar = tqdm(
             range(iterations_per_epoch), desc="Training", dynamic_ncols=True
         )
+
         optimizer.zero_grad()
         for epoch_iter in epoch_bar:
-            # for some reason this seems to be faster...
-            batch = next(loader)
-
-            # Increment the training iteration
+            batch = debug_batch if debug_overfit_single_batch else next(loader)
             n_iter += 1
 
-            # Forward pass (compute the output of the model)
+            # Inputs
             if len(input_keys) > 1:
-                inputs = {key: batch[key] for key in input_keys}
+                inputs = {key: batch[key].to(device) for key in input_keys}
+                expected_device = torch.device(device)
+                for key, tensor in inputs.items():
+                    if isinstance(tensor, torch.Tensor) and tensor.device != expected_device:
+                        inputs[key] = tensor.to(device)
             else:
-                inputs = batch[input_keys[0]]
-                # Assumes the model input is a single tensor
+                inputs = batch[input_keys[0]].to(device)
+                expected_device = torch.device(device)
+                if isinstance(inputs, torch.Tensor) and inputs.device != expected_device:
+                    inputs = inputs.to(device)
+
             outputs = model(inputs)
 
-            # Compute the loss
+            # Targets
             if len(target_keys) > 1:
-                targets = {key: batch[key] for key in target_keys}
+                targets = {key: batch[key].to(device) for key in target_keys}
             else:
-                targets = batch[target_keys[0]]
-                # Assumes the model output is a single tensor
-            loss = criterion(outputs, targets) / gradient_accumulation_steps
+                targets = batch[target_keys[0]].to(device)
 
-            # Backward pass (compute the gradients)
+            # Optional skip for all-zero targets
+            if skip_all_zero_targets:
+                if isinstance(targets, dict):
+                    t_list = [v for v in targets.values()]
+                    t = torch.stack(t_list, dim=1)
+                else:
+                    t = targets
+                if (t > 0).sum() == 0:
+                    # Pure background batch; skip
+                    continue
+
+            raw_loss = criterion(outputs, targets)
+
+            if not torch.isfinite(raw_loss):
+                print(
+                    f"WARNING: Non-finite loss encountered at iter {n_iter} "
+                    f"(epoch {epoch}). Skipping batch. loss={raw_loss.item()}"
+                )
+                optimizer.zero_grad()
+                continue
+            loss = raw_loss / gradient_accumulation_steps
             loss.backward()
 
-            # Clip the gradients if necessary
             if max_grad_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-            # Update the weights
             if (
-                epoch_iter % gradient_accumulation_steps == 0
+                (epoch_iter + 1) % gradient_accumulation_steps == 0
                 or epoch_iter == iterations_per_epoch - 1
             ):
-                # Only update the weights every `gradient_accumulation_steps` iterations
-                # This allows for larger effective batch sizes without increasing memory usage
                 optimizer.step()
                 optimizer.zero_grad()
 
-            # Update the progress bar
             post_fix_dict["Loss"] = f"{loss.item()}"
             epoch_bar.set_postfix(post_fix_dict)
-
-            # Log the loss using tensorboard
-            writer.add_scalar("loss", loss.item(), n_iter)
+            writer.add_scalar("loss", raw_loss.item(), n_iter)
 
         if scheduler is not None:
-            # Step the scheduler at the end of each epoch
             scheduler.step()
-            writer.add_scalar("lr", scheduler.get_last_lr()[0], n_iter)
+            if hasattr(scheduler, "get_last_lr"):
+                writer.add_scalar("lr", scheduler.get_last_lr()[0], n_iter)
 
-        # Save the model
         torch.save(
             model.state_dict(),
             format_string(model_save_path, {"epoch": epoch, "model_name": model_name}),
         )
 
-        # Compute the validation score by averaging the loss across the validation set
+        # Validation
         if len(val_loader.loader) > 0:
-            val_score = 0
+            val_score = 0.0
             val_loader.refresh()
+
             if validation_time_limit is not None:
-                elapsed_time = 0
+                elapsed_time = 0.0
                 last_time = time.time()
                 val_bar = val_loader.loader
                 pbar = tqdm(
@@ -442,30 +452,38 @@ def train(config_path: str):
                     dynamic_ncols=True,
                 )
 
-            # Free up GPU memory, disable backprop etc.
             torch.cuda.empty_cache()
             optimizer.zero_grad()
             model.eval()
 
-            # Validation loop
             with torch.no_grad():
                 i = 0
                 for batch in val_bar:
                     if len(input_keys) > 1:
-                        inputs = {key: batch[key] for key in input_keys}
+                        inputs = {key: batch[key].to(device) for key in input_keys}
+                        expected_device = torch.device(device)
+                        for key, tensor in inputs.items():
+                            if isinstance(tensor, torch.Tensor) and tensor.device != expected_device:
+                                inputs[key] = tensor.to(device)
                     else:
-                        inputs = batch[input_keys[0]]
+                        inputs = batch[input_keys[0]].to(device)
+                        expected_device = torch.device(device)
+                        if isinstance(inputs, torch.Tensor) and inputs.device != expected_device:
+                            inputs = inputs.to(device)
                     outputs = model(inputs)
 
-                    # Compute the loss
                     if len(target_keys) > 1:
-                        targets = {key: batch[key] for key in target_keys}
+                        targets = {key: batch[key].to(device) for key in target_keys}
                     else:
-                        targets = batch[target_keys[0]]
-                    val_score += criterion(outputs, targets).item()
+                        targets = batch[target_keys[0]].to(device)
+
+                    val_loss = criterion(outputs, targets)
+                    if not torch.isfinite(val_loss):
+                        continue
+
+                    val_score += val_loss.item()
                     i += 1
 
-                    # Check time limit
                     if validation_time_limit is not None:
                         last_elapsed_time = time.time() - last_time
                         elapsed_time += last_elapsed_time
@@ -473,58 +491,62 @@ def train(config_path: str):
                             break
                         pbar.update(last_elapsed_time)
                         last_time = time.time()
-                    # Check batch limit
                     elif (
                         validation_batch_limit is not None
                         and i >= validation_batch_limit
                     ):
                         break
-                val_score /= i
 
-                # Log the validation using tensorboard
+                if i > 0:
+                    val_score /= i
+                else:
+                    val_score = float("nan")
+
                 writer.add_scalar("validation", val_score, n_iter)
-
-                # Update the progress bar
                 post_fix_dict["Validation"] = f"{val_score:.4f}"
 
-        # Generate and save figures from the last batch of the validation to appear in tensorboard
+        # Figures
         if isinstance(outputs, dict):
-            outputs = list(outputs.values())
+            outputs_for_fig = list(outputs.values())
+        else:
+            outputs_for_fig = outputs
+
         if len(input_keys) == len(target_keys) != 1:
-            # If the number of input and target keys is the same, assume they are paired
-            for i, (in_key, target_key) in enumerate(zip(input_keys, target_keys)):
+            for idx, (in_key, target_key) in enumerate(zip(input_keys, target_keys)):
                 figs = get_fig_dict(
                     input_data=batch[in_key],
                     target_data=batch[target_key],
-                    outputs=outputs[i],
+                    outputs=outputs_for_fig[idx],
                     classes=classes,
                 )
                 array_name = longest_common_substring(in_key, target_key)
                 for name, fig in figs.items():
                     writer.add_figure(f"{name}: {array_name}", fig, n_iter)
                     plt.close(fig)
-
         else:
-            # If the number of input and target keys is not the same, assume that only the first input and target keys match
-            if isinstance(outputs, list):
-                outputs = outputs[0]
+            out_single = outputs_for_fig
+            if isinstance(out_single, list):
+                out_single = out_single[0]
+
             if isinstance(inputs, dict):
-                inputs = list(inputs.values())[0]
+                in_single = list(inputs.values())[0]
             elif isinstance(inputs, list):
-                inputs = inputs[0]
+                in_single = inputs[0]
+            else:
+                in_single = inputs
+
             if isinstance(targets, dict):
-                targets = list(targets.values())[0]
+                targ_single = list(targets.values())[0]
             elif isinstance(targets, list):
-                targets = targets[0]
-            figs = get_fig_dict(inputs, targets, outputs, classes)
+                targ_single = targets[0]
+            else:
+                targ_single = targets
+
+            figs = get_fig_dict(in_single, targ_single, out_single, classes)
             for name, fig in figs.items():
                 writer.add_figure(name, fig, n_iter)
                 plt.close(fig)
 
-        # Clear the GPU memory again
         torch.cuda.empty_cache()
 
-    # Close the summarywriter
     writer.close()
-
-    # %%

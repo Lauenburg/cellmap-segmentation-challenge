@@ -289,6 +289,20 @@ def make_s3_datasplit_csv(
         k: "train" if np.random.rand() > validation_prob else "validate"
         for k in datapaths.keys()
     }
+    # Enforce that there is one training and one validation crop if possible
+    train_count = sum(1 for v in usage_dict.values() if v == "train")
+    validate_count = sum(1 for v in usage_dict.values() if v == "validate")
+    if len(usage_dict) >= 2:
+        if train_count == 0:
+            usage_dict[list(usage_dict.keys())[0]] = "train"
+            train_count = 1
+            validate_count -= 1
+        elif validate_count == 0:
+            usage_dict[list(usage_dict.keys())[0]] = "validate"
+            validate_count = 1
+            train_count -= 1
+    elif len(usage_dict) == 1:
+        print(f"Warning: Only one dataset found. It will be assigned to '{list(usage_dict.values())[0]}' only.")
     num_train = num_validate = 0
     bar = tqdm(datapaths.keys())
     for path in bar:
@@ -409,11 +423,21 @@ def make_datasplit_csv(
         for k in datapaths.keys()
     }
     # Now enforce that there is one training and one validation crop if possible
+    train_count = sum(1 for v in usage_dict.values() if v == "train")
+    validate_count = sum(1 for v in usage_dict.values() if v == "validate")
     if len(usage_dict) >= 2:
-        if np.sum(usage_dict.values() == "train") == 0:
+        if train_count == 0:
             usage_dict[list(usage_dict.keys())[0]] = "train"
-        elif np.sum(usage_dict.values() == "validate") == 0:
+            train_count = 1
+            validate_count -= 1
+        elif validate_count == 0:
             usage_dict[list(usage_dict.keys())[0]] = "validate"
+            validate_count = 1
+            train_count -= 1
+    elif len(usage_dict) == 1:
+        # With only one dataset, we can't split it into train and validation
+        # Warn the user but proceed with the single assignment
+        print(f"Warning: Only one dataset found. It will be assigned to '{list(usage_dict.values())[0]}' only.")
     num_train = num_validate = 0
     bar = tqdm(datapaths.keys())
     for path in bar:
