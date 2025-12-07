@@ -18,10 +18,10 @@ class DoubleConv(nn.Module):
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+            nn.GroupNorm(num_groups=8, num_channels=mid_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(num_groups=8, num_channels=out_channels),
             nn.ReLU(inplace=True),
         )
 
@@ -43,7 +43,13 @@ class Down(nn.Module):
 
 
 class Up(nn.Module):
-    """Upscaling then double conv"""
+    """Upscaling (bilinear) then double conv.
+
+    Note:
+        We always use bilinear upsampling + Conv to avoid checkerboard artifacts
+        associated with ConvTranspose2d. The `bilinear` flag is kept only for
+        API compatibility and is not used.
+    """
 
     def __init__(self, in_channels, out_channels, bilinear=True):
         super().__init__()
@@ -103,7 +109,7 @@ class UNet_2D(nn.Module):
     n_classes : int
         Number of output channels.
     trilinear : bool
-        Whether to use trilinear interpolation or not.
+        Kept for API compatibility; Up always uses bilinear interpolation.
     """
 
     def __init__(self, n_channels, n_classes, trilinear=False):
